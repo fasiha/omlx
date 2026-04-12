@@ -165,7 +165,7 @@ from .exceptions import (
 from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
@@ -2630,6 +2630,7 @@ async def stream_chat_completion(
                         yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
     except Exception as e:
         logger.error(f"Error during chat streaming: {e}")
+        logger.debug(f"Stream accumulated raw text at error: {accumulated_text!r}")
         error_data = {
             "error": {"message": str(e), "type": "server_error"}
         }
