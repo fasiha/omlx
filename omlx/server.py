@@ -1887,6 +1887,47 @@ async def create_chat_completion(
             content_preview = str(msg.content)[:200] if msg.content else "(empty)"
             logger.log(5, "  Message[%d]: role=%s, content=%s...", i, msg.role, content_preview)
 
+    # Log full request/response to SQLite for offline review.
+    # Path can be overridden with OMLX_IO_LOG env var; set to "" to disable.
+    _default_io_log = os.path.join(
+        str(_server_state.global_settings.base_path) if _server_state.global_settings
+        else os.path.expanduser("~/.omlx"),
+        "io.db"
+    )
+    _io_log_path = os.environ.get("OMLX_IO_LOG", _default_io_log)
+    _io_request_id = None
+    if _io_log_path:
+        import sqlite3, datetime
+        _io_db = sqlite3.connect(_io_log_path)
+        _io_db.execute("""
+            CREATE TABLE IF NOT EXISTS io_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT,
+                model TEXT,
+                type TEXT,
+                request_id INTEGER,
+                messages TEXT,
+                tools TEXT,
+                raw_text TEXT,
+                tool_calls TEXT,
+                prompt_tokens INTEGER,
+                completion_tokens INTEGER
+            )
+        """)
+        cur = _io_db.execute(
+            "INSERT INTO io_log (ts, model, type, messages, tools) VALUES (?, ?, ?, ?, ?)",
+            (
+                datetime.datetime.now().isoformat(),
+                request.model,
+                "request",
+                json.dumps([m.model_dump() for m in request.messages], ensure_ascii=False),
+                json.dumps([t.model_dump() for t in (request.tools or [])], ensure_ascii=False),
+            ),
+        )
+        _io_request_id = cur.lastrowid
+        _io_db.commit()
+        _io_db.close()
+
     # Block inference during quantization to prevent GPU Metal errors
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
@@ -2051,7 +2092,7 @@ async def create_chat_completion(
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(
-                stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, **chat_kwargs),
+                stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, io_log_path=_io_log_path, io_request_id=_io_request_id, **chat_kwargs),
                 http_request=http_request,
             ),
             media_type="text/event-stream",
@@ -2067,6 +2108,26 @@ async def create_chat_completion(
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
         logger.info(f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
+        logger.debug(f"Model raw output text: {output.text!r}")
+        logger.debug(f"Model tool_calls: {output.tool_calls!r}")
+        if _io_log_path:
+            import sqlite3, datetime
+            _io_db = sqlite3.connect(_io_log_path)
+            _io_db.execute(
+                "INSERT INTO io_log (ts, model, type, request_id, raw_text, tool_calls, prompt_tokens, completion_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    datetime.datetime.now().isoformat(),
+                    request.model,
+                    "response",
+                    _io_request_id,
+                    output.text,
+                    json.dumps(output.tool_calls, ensure_ascii=False) if output.tool_calls else None,
+                    output.prompt_tokens,
+                    output.completion_tokens,
+                ),
+            )
+            _io_db.commit()
+            _io_db.close()
 
         get_server_metrics().record_request_complete(
             prompt_tokens=output.prompt_tokens,
@@ -2483,6 +2544,8 @@ async def stream_chat_completion(
     messages: list,
     request: ChatCompletionRequest,
     model_load_duration: float = 0.0,
+    io_log_path: str = "",
+    io_request_id: int | None = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response.
@@ -2630,6 +2693,23 @@ async def stream_chat_completion(
                 yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
     # Parse tool calls from accumulated text
+    logger.debug(f"Stream accumulated raw text: {accumulated_text!r}")
+    if io_log_path:
+        import sqlite3, datetime
+        _io_db = sqlite3.connect(io_log_path)
+        _io_db.execute(
+            "INSERT INTO io_log (ts, model, type, request_id, raw_text, tool_calls) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                datetime.datetime.now().isoformat(),
+                request.model,
+                "response_stream",
+                io_request_id,
+                accumulated_text,
+                json.dumps(last_output.tool_calls, ensure_ascii=False) if last_output and last_output.tool_calls else None,
+            ),
+        )
+        _io_db.commit()
+        _io_db.close()
     tool_calls = None
     cleaned_text = accumulated_text
     if last_output and last_output.tool_calls:
