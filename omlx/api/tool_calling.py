@@ -287,7 +287,46 @@ def _gemma4_args_to_json_robust(args_str: str) -> dict:
     # 2. Quote bare keys (allow whitespace after { or ,)
     text = regex.sub(r"(?<=[{,])\s*(\w+)\s*:", r' "\1":', text)
 
-    # 3. Restore captured strings as properly escaped JSON strings
+    # 3a. Repair structural bracket errors BEFORE restoring string content.
+    # Walking the placeholder text (no embedded { } from code) is safe because
+    # placeholders like \x000\x00 contain no brackets.  Common Gemma 4 error:
+    # `[{key:PH},outer_key:PH}` missing the `]` that closes the array before
+    # `outer_key`.  Detect `,` directly inside `[` followed by `"key":` and
+    # insert the missing `]`.
+    def _repair_missing_array_closers(s: str) -> str:
+        stack: list[str] = []
+        result: list[str] = []
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if ch in ("{", "["):
+                stack.append(ch)
+                result.append(ch)
+            elif ch == "}":
+                if stack and stack[-1] == "{":
+                    stack.pop()
+                result.append(ch)
+            elif ch == "]":
+                if stack and stack[-1] == "[":
+                    stack.pop()
+                result.append(ch)
+            elif ch == ",":
+                if stack and stack[-1] == "[":
+                    rest = s[i + 1:].lstrip()
+                    if re.match(r'"[^"]+"\s*:', rest):
+                        result.append("]")
+                        stack.pop()
+                result.append(ch)
+            else:
+                result.append(ch)
+            i += 1
+        return "".join(result)
+
+    repaired_structure = _repair_missing_array_closers(text)
+    if repaired_structure != text:
+        text = repaired_structure
+
+    # 3b. Restore captured strings as properly escaped JSON strings
     for i, s in enumerate(strings):
         text = text.replace(f"\x00{i}\x00", json.dumps(s))
 
@@ -312,6 +351,12 @@ def _gemma4_args_to_json_robust(args_str: str) -> dict:
     text = regex.sub(
         r"(:\s*)([^\",\[\]{}\s][^,}]*?)(\s*[,}])", _quote_bare, text
     )
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
     return json.loads(text)
 
 
@@ -322,20 +367,39 @@ def _parse_gemma4_tool_call_fallback(text: str) -> Union[dict, list]:
     Extends mlx-lm's parser to handle:
     - Bare string values without ``<|"|>`` delimiters
     - Colons / dots / hyphens in function names
+    - File content inside ``<|"|>`` delimiters containing unbalanced braces
+      (e.g. a code snippet ending mid-function like ``function foo() {``)
     """
     import regex
+
+    # Before running the brace-balancing regex we mask every <|"|>...<|"|>
+    # span with a brace-free placeholder.  Without this, { and } inside
+    # string values (JavaScript function bodies, object literals, etc.) fool
+    # the recursive brace matcher and it either fails or extracts the wrong
+    # closing brace.  We restore the original spans in the args string
+    # afterwards so that _gemma4_args_to_json_robust can decode them normally.
+    spans: list[str] = []
+
+    def _mask(m: re.Match) -> str:
+        spans.append(m.group(0))          # keep the whole <|"|>...<|"|> span
+        return f"__S{len(spans) - 1}__"  # placeholder contains no { or }
+
+    masked_text = re.sub(r'<\|"\|>.*?<\|"\|>', _mask, text, flags=re.DOTALL)
 
     pattern = regex.compile(
         r"call:([\w:.-]+)(\{(?:[^{}]|(?2))*\})", regex.DOTALL
     )
-    matches = list(pattern.finditer(text))
+    matches = list(pattern.finditer(masked_text))
     if not matches:
         raise ValueError("No function call found in Gemma 4 format")
+
+    def _restore(s: str) -> str:
+        return re.sub(r"__S(\d+)__", lambda m: spans[int(m.group(1))], s)
 
     results = []
     for match in matches:
         func_name = match.group(1)
-        args_str = match.group(2)
+        args_str = _restore(match.group(2))  # restore original string spans
 
         # Try standard JSON first (model may emit valid JSON args)
         try:
@@ -371,6 +435,40 @@ def parse_tool_calls(
     """
     cleaned_text = text
 
+    # Rescue tool calls that Gemma 4 sometimes emits inside <think> blocks.
+    # The model occasionally starts a tool call mid-thought and either closes
+    # the think block after the tool call, or never closes it at all.  In
+    # either case the standard think-stripping below would discard the call.
+    # Strategy: for every <think>…</think> block (or an unclosed <think> that
+    # runs to end-of-string), if a tool_call_start marker appears inside it,
+    # split the think block at that point: keep the pre-call reasoning inside
+    # <think>…</think> and move the tool call (and anything after it) outside.
+    if getattr(tokenizer, "has_tool_calling", False):
+        _tcs = getattr(tokenizer, "tool_call_start", None)
+        if _tcs and _tcs in cleaned_text:
+            def _rescue_tool_call_from_think(m: re.Match) -> str:
+                think_body = m.group(1)  # content between <think> and </think>
+                tc_idx = think_body.find(_tcs)
+                if tc_idx == -1:
+                    return m.group(0)  # no tool call inside, leave unchanged
+                # Everything before the tool call stays in the think block;
+                # the tool call and anything after it moves outside.
+                return f"<think>{think_body[:tc_idx]}</think>{think_body[tc_idx:]}"
+
+            # Handle closed think blocks first.
+            cleaned_text = re.sub(
+                r"<think>(.*?)</think>", _rescue_tool_call_from_think,
+                cleaned_text, flags=re.DOTALL,
+            )
+            # Handle an unclosed think block that runs to end-of-string.
+            unclosed = re.search(r"<think>(.*)\Z", cleaned_text, re.DOTALL)
+            if unclosed:
+                think_body = unclosed.group(1)
+                tc_idx = think_body.find(_tcs)
+                if tc_idx != -1:
+                    replacement = f"<think>{think_body[:tc_idx]}</think>{think_body[tc_idx:]}"
+                    cleaned_text = cleaned_text[: unclosed.start()] + replacement
+
     # Remove thinking tags if present (reasoning models)
     cleaned_text = re.sub(
         r"<think>.*?</think>", "", cleaned_text, flags=re.DOTALL
@@ -381,6 +479,7 @@ def parse_tool_calls(
         tool_call_start = tokenizer.tool_call_start
         tool_call_end = tokenizer.tool_call_end
         tool_parser = tokenizer.tool_parser
+        logger.debug(f"parse_tool_calls: cleaned_text={cleaned_text!r}, tool_call_start={tool_call_start!r}, tool_call_end={tool_call_end!r}")
 
         if tool_call_start is not None and tool_parser is not None:
             tool_calls = []
@@ -390,7 +489,7 @@ def parse_tool_calls(
                 # Paired markers (e.g. <tool_call>...</tool_call>)
                 end_escaped = re.escape(tool_call_end)
                 pattern = rf"{start_escaped}(.*?){end_escaped}"
-                matches = re.findall(pattern, text, re.DOTALL)
+                matches = re.findall(pattern, cleaned_text, re.DOTALL)
             else:
                 # One-sided marker (e.g. Mistral/Devstral "[TOOL_CALLS]"):
                 # split on the start marker and parse each segment.
@@ -448,8 +547,12 @@ def parse_tool_calls(
                             ValueError,
                             json.JSONDecodeError,
                             KeyError,
-                        ):
-                            pass
+                        ) as _fallback_err:
+                            logger.warning(
+                                "Gemma4 fallback parser also failed: %s. Match: %s",
+                                _fallback_err,
+                                match.strip()[:300],
+                            )
                     continue
 
             if tool_calls:
@@ -501,18 +604,35 @@ def parse_tool_calls(
                     "stripping markers. Raw content: %s",
                     stripped,
                 )
-            cleaned_text = re.sub(
-                rf"{s_esc}.*?{e_esc}", "", cleaned_text, flags=re.DOTALL
-            ).strip()
+                error_lines = [
+                    "Tool call parsing failed. The following tool call(s) could not be executed:"
+                ]
+                for raw in stripped:
+                    error_lines.append(f"  {raw.strip()[:200]}")
+                error_lines.append(
+                    "Please retry using only the available tools with correct call syntax: "
+                    "call:tool_name{key:<|\"|>value<|\"|>}"
+                )
+                cleaned_text = "\n".join(error_lines)
+            else:
+                cleaned_text = re.sub(
+                    rf"{s_esc}.*?{e_esc}", "", cleaned_text, flags=re.DOTALL
+                ).strip()
         elif _start:
             idx = cleaned_text.find(_start)
             if idx >= 0:
+                raw_attempt = cleaned_text[idx:]
                 logger.warning(
                     "Tool call start marker found but parsing failed, "
                     "stripping marker. Raw content: %s",
-                    cleaned_text[idx:],
+                    raw_attempt,
                 )
-                cleaned_text = cleaned_text[:idx].strip()
+                cleaned_text = (
+                    cleaned_text[:idx].strip()
+                    + f"\nTool call parsing failed: {raw_attempt.strip()[:200]}\n"
+                    "Please retry using only the available tools with correct call syntax: "
+                    "call:tool_name{key:<|\"|>value<|\"|>}"
+                )
 
     return cleaned_text, None
 
