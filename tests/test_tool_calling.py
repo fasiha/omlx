@@ -1549,8 +1549,9 @@ class TestParseToolCallsGemma4Integration:
 
         Gemma 4 occasionally begins a tool call mid-thought and closes the
         think block after the call marker, or places the entire call inside
-        the think block.  Without rescue the call is silently dropped and the
-        agent loops forever re-requesting the same action.
+        the think block.  Without rescue the call is silently dropped and
+        the agent stalls — the model believed it issued a call but nothing
+        was executed.
         """
         tok = self._make_gemma4_tokenizer()
         # Tool call appears inside the think block, closed think tag follows.
@@ -1562,7 +1563,7 @@ class TestParseToolCallsGemma4Integration:
         )
         cleaned, tool_calls = parse_tool_calls(text, tok, None)
 
-        assert tool_calls is not None, "tool call inside <think> block was silently dropped"
+        assert tool_calls is not None, "tool call inside <think> block was silently discarded"
         assert len(tool_calls) == 1
         assert tool_calls[0].function.name == "bash"
         args = json.loads(tool_calls[0].function.arguments)
@@ -1584,7 +1585,7 @@ class TestParseToolCallsGemma4Integration:
         )
         cleaned, tool_calls = parse_tool_calls(text, tok, None)
 
-        assert tool_calls is not None, "tool call inside unclosed <think> block was silently dropped"
+        assert tool_calls is not None, "tool call inside unclosed <think> block was silently discarded"
         assert len(tool_calls) == 1
         assert tool_calls[0].function.name == "bash"
 

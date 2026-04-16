@@ -371,6 +371,40 @@ def parse_tool_calls(
     """
     cleaned_text = text
 
+    # Rescue tool calls that Gemma 4 sometimes emits inside <think> blocks.
+    # The model occasionally starts a tool call mid-thought and either closes
+    # the think block after the tool call, or never closes it at all.  In
+    # either case the standard think-stripping below would discard the call.
+    # Strategy: for every <think>…</think> block (or an unclosed <think> that
+    # runs to end-of-string), if a tool_call_start marker appears inside it,
+    # split the think block at that point: keep the pre-call reasoning inside
+    # <think>…</think> and move the tool call (and anything after it) outside.
+    if getattr(tokenizer, "has_tool_calling", False):
+        _tcs = getattr(tokenizer, "tool_call_start", None)
+        if _tcs and _tcs in cleaned_text:
+            def _rescue_tool_call_from_think(m: re.Match) -> str:
+                think_body = m.group(1)  # content between <think> and </think>
+                tc_idx = think_body.find(_tcs)
+                if tc_idx == -1:
+                    return m.group(0)  # no tool call inside, leave unchanged
+                # Everything before the tool call stays in the think block;
+                # the tool call and anything after it moves outside.
+                return f"<think>{think_body[:tc_idx]}</think>{think_body[tc_idx:]}"
+
+            # Handle closed think blocks first.
+            cleaned_text = re.sub(
+                r"<think>(.*?)</think>", _rescue_tool_call_from_think,
+                cleaned_text, flags=re.DOTALL,
+            )
+            # Handle an unclosed think block that runs to end-of-string.
+            unclosed = re.search(r"<think>(.*)\Z", cleaned_text, re.DOTALL)
+            if unclosed:
+                think_body = unclosed.group(1)
+                tc_idx = think_body.find(_tcs)
+                if tc_idx != -1:
+                    replacement = f"<think>{think_body[:tc_idx]}</think>{think_body[tc_idx:]}"
+                    cleaned_text = cleaned_text[: unclosed.start()] + replacement
+
     # Remove thinking tags if present (reasoning models)
     cleaned_text = re.sub(
         r"<think>.*?</think>", "", cleaned_text, flags=re.DOTALL
@@ -390,7 +424,7 @@ def parse_tool_calls(
                 # Paired markers (e.g. <tool_call>...</tool_call>)
                 end_escaped = re.escape(tool_call_end)
                 pattern = rf"{start_escaped}(.*?){end_escaped}"
-                matches = re.findall(pattern, text, re.DOTALL)
+                matches = re.findall(pattern, cleaned_text, re.DOTALL)
             else:
                 # One-sided marker (e.g. Mistral/Devstral "[TOOL_CALLS]"):
                 # split on the start marker and parse each segment.
