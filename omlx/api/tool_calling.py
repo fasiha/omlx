@@ -322,20 +322,39 @@ def _parse_gemma4_tool_call_fallback(text: str) -> Union[dict, list]:
     Extends mlx-lm's parser to handle:
     - Bare string values without ``<|"|>`` delimiters
     - Colons / dots / hyphens in function names
+    - File content inside ``<|"|>`` delimiters containing unbalanced braces
+      (e.g. a code snippet that opens a brace without closing it)
     """
     import regex
+
+    # Before running the brace-balancing regex we mask every <|"|>...<|"|>
+    # span with a brace-free placeholder.  Without this, an unbalanced { or }
+    # inside a string value (e.g. the start of a JavaScript function body)
+    # fools the recursive brace matcher and it fails to find the true closing
+    # } of the args block.  We restore the original spans afterwards so that
+    # _gemma4_args_to_json_robust can decode them normally.
+    spans: list[str] = []
+
+    def _mask(m: re.Match) -> str:
+        spans.append(m.group(0))          # keep the whole <|"|>...<|"|> span
+        return f"__S{len(spans) - 1}__"  # placeholder contains no { or }
+
+    masked_text = re.sub(r'<\|"\|>.*?<\|"\|>', _mask, text, flags=re.DOTALL)
 
     pattern = regex.compile(
         r"call:([\w:.-]+)(\{(?:[^{}]|(?2))*\})", regex.DOTALL
     )
-    matches = list(pattern.finditer(text))
+    matches = list(pattern.finditer(masked_text))
     if not matches:
         raise ValueError("No function call found in Gemma 4 format")
+
+    def _restore(s: str) -> str:
+        return re.sub(r"__S(\d+)__", lambda m: spans[int(m.group(1))], s)
 
     results = []
     for match in matches:
         func_name = match.group(1)
-        args_str = match.group(2)
+        args_str = _restore(match.group(2))  # restore original string spans
 
         # Try standard JSON first (model may emit valid JSON args)
         try:
