@@ -1409,6 +1409,21 @@ class TestGemma4ArgsToJsonRobust:
         result = _gemma4_args_to_json_robust("{}")
         assert result == {}
 
+    def test_missing_array_closer_before_sibling_key(self):
+        """Gemma 4 sometimes omits the ] that closes an array arg before the next
+        top-level key.  The model emits ``[{...},path:`` instead of ``[{...}],path:``.
+        The function must insert the missing closer and still return the correct dict.
+        """
+        # Reproduces real Gemma 4 output where the edits array is never closed
+        # before the sibling ``path`` key.
+        result = _gemma4_args_to_json_robust(
+            '{edits:[{newText:<|"|>foo<|"|>,oldText:<|"|>bar<|"|>},path:<|"|>x.js<|"|>}'
+        )
+        assert result == {
+            "edits": [{"newText": "foo", "oldText": "bar"}],
+            "path": "x.js",
+        }
+
 
 class TestParseGemma4ToolCallFallback:
     """Tests for _parse_gemma4_tool_call_fallback()."""
