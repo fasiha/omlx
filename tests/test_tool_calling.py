@@ -1459,6 +1459,26 @@ class TestParseGemma4ToolCallFallback:
         with pytest.raises(ValueError):
             _parse_gemma4_tool_call_fallback("not a tool call")
 
+    def test_string_value_containing_unbalanced_open_brace(self):
+        """<|"|>-delimited string values that contain an unbalanced { must not
+        confuse the recursive brace-balance regex used to find the closing }
+        of the call:name{args} envelope.
+
+        Occurs in practice when a coding agent passes a code snippet that
+        opens a brace without closing it — e.g. the start of a function body.
+        The recursive pattern (?:[^{}]|(?2))* sees the unmatched { inside the
+        string value and fails to find the true closing } of the args block.
+        """
+        # newText contains an unclosed { (end of a partial code block).
+        # Use a variable for the Gemma 4 string delimiter to avoid confusing
+        # Python's parser with the angle-pipe-quote sequence.
+        D = '<|"|>'
+        raw = f"call:edit{{newText:{D}function setup() {{{D},oldText:{D}old code{D}}}"
+        result = _parse_gemma4_tool_call_fallback(raw)
+        assert result["name"] == "edit"
+        assert result["arguments"]["newText"] == "function setup() {"
+        assert result["arguments"]["oldText"] == "old code"
+
 
 class TestParseToolCallsGemma4Integration:
     """Integration tests for parse_tool_calls() with Gemma 4 tokenizer."""
