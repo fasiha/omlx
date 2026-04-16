@@ -287,7 +287,46 @@ def _gemma4_args_to_json_robust(args_str: str) -> dict:
     # 2. Quote bare keys (allow whitespace after { or ,)
     text = regex.sub(r"(?<=[{,])\s*(\w+)\s*:", r' "\1":', text)
 
-    # 3. Restore captured strings as properly escaped JSON strings
+    # 3a. Repair structural bracket errors BEFORE restoring string content.
+    # Walking the placeholder text (no embedded { } from code) is safe because
+    # placeholders like \x000\x00 contain no brackets.  Common Gemma 4 error:
+    # `[{key:PH},outer_key:PH}` missing the `]` that closes the array before
+    # `outer_key`.  Detect `,` directly inside `[` followed by `"key":` and
+    # insert the missing `]`.
+    def _repair_missing_array_closers(s: str) -> str:
+        stack: list[str] = []
+        result: list[str] = []
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if ch in ("{", "["):
+                stack.append(ch)
+                result.append(ch)
+            elif ch == "}":
+                if stack and stack[-1] == "{":
+                    stack.pop()
+                result.append(ch)
+            elif ch == "]":
+                if stack and stack[-1] == "[":
+                    stack.pop()
+                result.append(ch)
+            elif ch == ",":
+                if stack and stack[-1] == "[":
+                    rest = s[i + 1:].lstrip()
+                    if re.match(r'"[^"]+"\s*:', rest):
+                        result.append("]")
+                        stack.pop()
+                result.append(ch)
+            else:
+                result.append(ch)
+            i += 1
+        return "".join(result)
+
+    repaired_structure = _repair_missing_array_closers(text)
+    if repaired_structure != text:
+        text = repaired_structure
+
+    # 3b. Restore captured strings as properly escaped JSON strings
     for i, s in enumerate(strings):
         text = text.replace(f"\x00{i}\x00", json.dumps(s))
 
@@ -312,6 +351,12 @@ def _gemma4_args_to_json_robust(args_str: str) -> dict:
     text = regex.sub(
         r"(:\s*)([^\",\[\]{}\s][^,}]*?)(\s*[,}])", _quote_bare, text
     )
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
     return json.loads(text)
 
 
