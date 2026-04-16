@@ -1543,6 +1543,51 @@ class TestParseToolCallsGemma4Integration:
         assert len(tool_calls) == 1
         assert tool_calls[0].function.name == "search"
 
+    def test_tool_call_inside_closed_think_block_is_rescued(self):
+        """A Gemma 4 tool call emitted inside a closed <think>...</think> block
+        must be rescued before think-stripping discards it.
+
+        Gemma 4 occasionally begins a tool call mid-thought and closes the
+        think block after the call marker, or places the entire call inside
+        the think block.  Without rescue the call is silently dropped and the
+        agent loops forever re-requesting the same action.
+        """
+        tok = self._make_gemma4_tokenizer()
+        # Tool call appears inside the think block, closed think tag follows.
+        D = '<|"|>'  # Gemma 4 string delimiter
+        text = (
+            f"<think>Let me check the file.\n"
+            f"<|tool_call>\ncall:bash{{command:{D}ls{D}}}\n<tool_call|>\n"
+            f"</think>"
+        )
+        cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        assert tool_calls is not None, "tool call inside <think> block was silently dropped"
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "bash"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["command"] == "ls"
+
+    def test_tool_call_inside_unclosed_think_block_is_rescued(self):
+        """A Gemma 4 tool call inside an unclosed <think> block (no </think>)
+        must also be rescued.
+
+        Some responses omit the closing </think> tag entirely when the model
+        transitions directly from reasoning to a tool call.
+        """
+        tok = self._make_gemma4_tokenizer()
+        # No closing </think> — the think block runs to end-of-string.
+        D = '<|"|>'  # Gemma 4 string delimiter
+        text = (
+            f"<think>I should list the directory.\n"
+            f"<|tool_call>\ncall:bash{{command:{D}ls{D}}}\n<tool_call|>\n"
+        )
+        cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        assert tool_calls is not None, "tool call inside unclosed <think> block was silently dropped"
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "bash"
+
 
 class TestEnrichToolParamsForGemma4:
     """Tests for enrich_tool_params_for_gemma4()."""
